@@ -35,14 +35,19 @@ const score = computed(() => {
 })
 
 const standout = computed(() => {
-  const levels = [...new Set(timeline.value.map((row) => Math.abs(row.shift)).filter(Boolean))]
-  levels.sort((a, b) => b - a)
-  return new Set(levels.slice(0, 2))
+  const amounts = timeline.value.map((row) => Math.abs(row.shift)).filter(Boolean)
+  if (!amounts.length) return new Set()
+  const max = Math.max(...amounts)
+  const majors = new Set([max])
+  const alone = timeline.value.filter((row) => Math.abs(row.shift) === max).length === 1
+  const next = Math.max(0, ...amounts.filter((amount) => amount < max))
+  if (alone && next) majors.add(next)
+  return majors
 })
 
 const shown = computed(() => {
   const rows = [...timeline.value]
-  if (mode.value === 'true') rows.sort((a, b) => a.true_pos - b.true_pos)
+  if (mode.value === 'true') rows.sort((a, b) => Number(a.true_pos) - Number(b.true_pos))
   return rows
 })
 
@@ -89,7 +94,6 @@ function formatWhen(dateText, precision) {
 function cardClass(card) {
   const amount = Math.abs(card.shift)
   return {
-    fresh: false,
     'is-major': amount > 0 && standout.value.has(amount),
     'is-off': amount > 0 && !standout.value.has(amount),
   }

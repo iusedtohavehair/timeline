@@ -1,13 +1,16 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import { getGameEvents, submitGame } from './api.js'
+import Demographics from './components/Demographics.vue'
 import Timeline from './components/Timeline.vue'
 import Result from './components/Result.vue'
 
 const ID_KEY = 'timeline.playerId'
+const DEMO_KEY = 'timeline.demographicsDone'
 
 const phase = ref('intro')
 const playerId = ref(readPlayerId())
+const pendingDemo = ref({})
 const events = ref([])
 const placed = ref([])
 const placements = ref([])
@@ -18,6 +21,10 @@ const round = ref(0)
 const result = ref(null)
 const loading = ref(false)
 const error = ref(null)
+const privacyEl = ref(null)
+
+const contactEmail = String(import.meta.env.VITE_CONTACT_EMAIL || '').trim()
+const mailto = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail) ? contactEmail : ''
 
 const current = computed(() => events.value[cursor.value] || null)
 const step = computed(() => Math.min(cursor.value + 1, events.value.length || 10))
@@ -36,14 +43,52 @@ function readPlayerId() {
   }
 }
 
-function messageFor(err, kind) {
-  const raw = String(err?.message || '')
-  if (raw === 'config') {
-    return { kind, text: 'Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env, then refresh.' }
+function sawDemographics() {
+  try {
+    return localStorage.getItem(DEMO_KEY) === '1'
+  } catch {
+    return false
   }
-  if (raw === 'short') return { kind, text: 'Fewer than 10 events are available right now.' }
-  if (raw === 'bad result') return { kind, text: 'The reveal came back empty.' }
-  return { kind, text: raw || 'The game could not reach the database. Try again.' }
+}
+
+function markDemographics() {
+  try {
+    localStorage.setItem(DEMO_KEY, '1')
+  } catch {
+    /* private mode can still finish this visit */
+  }
+}
+
+function messageFor(err, kind) {
+  const raw = [err?.message, err?.details, err?.hint].filter(Boolean).join(' ')
+  if (raw === 'config') {
+    return { kind, text: 'Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env, then refresh.', detail: '' }
+  }
+  if (raw === 'short') return { kind, text: 'Fewer than 10 events are available right now.', detail: '' }
+  if (raw === 'bad result') return { kind, text: 'The reveal came back empty.', detail: '' }
+  return { kind, text: 'The game could not reach the database. Try again.', detail: raw }
+}
+
+function play() {
+  error.value = null
+  if (!sawDemographics()) {
+    phase.value = 'demographics'
+    return
+  }
+  pendingDemo.value = {}
+  startRound()
+}
+
+function onDemo(demo) {
+  const empty = !demo || Object.keys(demo).length === 0
+  pendingDemo.value = empty ? {} : demo
+  if (empty) markDemographics()
+  startRound()
+}
+
+function playAgain() {
+  pendingDemo.value = {}
+  startRound()
 }
 
 async function startRound() {
@@ -76,6 +121,7 @@ async function startRound() {
 function onPlace(insertIndex) {
   const event = current.value
   if (!event || loading.value || error.value) return
+  if (insertIndex < 0 || insertIndex > placed.value.length) return
   if (placements.value.some((item) => item.event_id === event.id)) return
   const responseMs = Math.max(0, Math.min(Date.now() - shownAt.value, 2147483647))
   placements.value.push({
@@ -95,10 +141,12 @@ async function finish() {
   loading.value = true
   error.value = null
   try {
-    let data = await submitGame(playerId.value, {}, placements.value)
+    let data = await submitGame(playerId.value, pendingDemo.value || {}, placements.value)
     if (typeof data === 'string') data = JSON.parse(data)
     if (!data || !Array.isArray(data.timeline)) throw new Error('bad result')
     result.value = data
+    pendingDemo.value = {}
+    markDemographics()
     phase.value = 'result'
   } catch (err) {
     error.value = messageFor(err, 'submit')
@@ -111,12 +159,25 @@ function retry() {
   if (error.value?.kind === 'submit') finish()
   else startRound()
 }
+
+function openPrivacy() {
+  privacyEl.value?.showModal()
+}
+
+function closePrivacy() {
+  privacyEl.value?.close()
+}
+
+function onPrivacyClick(event) {
+  if (event.target === privacyEl.value) privacyEl.value.close()
+}
 </script>
 
 <template>
   <div class="wrap">
     <header class="top">
       <h1>Timeline</h1>
+      <button class="texty" type="button" @click="openPrivacy">Privacy</button>
     </header>
 
     <section v-if="phase === 'intro'" class="panel">
@@ -126,17 +187,20 @@ function retry() {
         <li>Tap a gap to place each one earlier or later.</li>
         <li>At the end, the true dates come out.</li>
       </ol>
-      <button class="primary" type="button" @click="startRound">Play</button>
+      <button class="primary" type="button" @click="play">Play</button>
     </section>
 
+    <Demographics v-else-if="phase === 'demographics'" @done="onDemo" />
+
     <section v-else-if="phase === 'result' && result">
-      <Result :result="result" @again="startRound" />
+      <Result :result="result" @again="playAgain" />
     </section>
 
     <section v-else>
       <p v-if="loading && !events.length" class="hint" aria-live="polite">Shuffling 10 events…</p>
       <div v-if="error" class="notice">
         <p>{{ error.text }}</p>
+        <p v-if="error.detail" class="detail">{{ error.detail }}</p>
         <p v-if="error.kind === 'submit'" class="hint">Your placements are still on this device.</p>
         <button class="primary" type="button" :disabled="loading" @click="retry">Retry</button>
       </div>
@@ -152,5 +216,22 @@ function retry() {
         @place="onPlace"
       />
     </section>
+
+    <dialog ref="privacyEl" @click="onPrivacyClick">
+      <h2>Privacy</h2>
+      <p>
+        This game can store an optional age bracket, sex, country, and the order of your answers.
+        A random id stays in this browser so later games can be grouped. That id is not your name.
+      </p>
+      <p>Not collected: your name, your email address, or your IP address.</p>
+      <p>The reason is anonymous statistics about how people place recent events.</p>
+      <p v-if="mailto">
+        To ask for deletion, write to <a :href="'mailto:' + mailto">{{ mailto }}</a>.
+      </p>
+      <p v-else>To ask for deletion, write to the site owner. This build has no contact email yet.</p>
+      <div class="actions">
+        <button class="primary" type="button" @click="closePrivacy">Close</button>
+      </div>
+    </dialog>
   </div>
 </template>

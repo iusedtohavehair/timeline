@@ -1,5 +1,5 @@
 <script setup>
-import { nextTick, watch } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 
 const props = defineProps({
   placed: { type: Array, required: true },
@@ -38,10 +38,7 @@ function slotLabel(index) {
   return 'Place event'
 }
 
-const titleEl = { el: null }
-function setTitle(el) {
-  titleEl.el = el
-}
+const titleEl = ref(null)
 
 watch(() => props.freshId, async (id) => {
   if (id == null) return
@@ -57,7 +54,7 @@ watch(() => props.freshId, async (id) => {
 watch(() => props.current && props.current.id, async (id) => {
   if (!id) return
   await nextTick()
-  titleEl.el?.focus({ preventScroll: true })
+  titleEl.value?.focus({ preventScroll: true })
 }, { immediate: true })
 </script>
 
@@ -66,15 +63,13 @@ watch(() => props.current && props.current.id, async (id) => {
     <div v-if="current" class="deal" aria-live="polite">
       <p class="progress">{{ step }} / {{ total }}</p>
       <p class="tag">{{ label(current.category) }}</p>
-      <h2 :ref="setTitle" tabindex="-1">{{ current.title }}</h2>
+      <h2 ref="titleEl" tabindex="-1">{{ current.title }}</h2>
       <p class="desc">{{ current.description }}</p>
       <p v-if="placed.length === 1" class="hint">
         The first event is your anchor. Tap a + to place this one earlier or later.
       </p>
     </div>
-    <p v-else class="hint" aria-live="polite">
-      {{ busy ? 'Checking the real dates…' : 'That is the whole timeline.' }}
-    </p>
+    <p v-else-if="busy" class="hint" aria-live="polite">Checking the real dates…</p>
 
     <div class="bleed">
       <div class="scroller" tabindex="0" aria-label="Timeline, earlier on the left, later on the right">
@@ -92,7 +87,7 @@ watch(() => props.current && props.current.id, async (id) => {
             <article
               :id="'placed-' + card.id"
               class="mini"
-              :class="{ fresh: card.id === freshId }"
+              :class="{ fresh: String(card.id) === String(freshId) }"
             >
               <p class="tag">{{ label(card.category) }}</p>
               <h3>{{ card.title }}</h3>
