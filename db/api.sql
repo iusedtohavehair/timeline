@@ -1,29 +1,63 @@
 -- Browser API for the timeline game. Run db/schema.sql first. Safe to re-run.
 --
--- The public anon key may call only these two functions. Dates stay in the
--- database until submit_game. Direct reads and writes are revoked for the
+-- The publishable key (sb_publishable_...) signs in as the anon role and may
+-- call only these functions. get_game_events returns a date for the first
+-- card only (the anchor). Every other date stays in the database until
+-- submit_game. Direct reads and writes are revoked for the
 -- anon and authenticated roles, and row level security is enabled with no
 -- policies (default deny).
 --
 -- The table owner and the Supabase service role are left alone, so the SQL
 -- editor and an n8n workflow that uses the service role keep working.
 --
+-- get_game_events(p_n, p_level) draws active events whose niche_level matches
+-- the choice: 1 is the easiest, 3 is niche.
+-- check_placement judges one drop against the cards already on the line.
+-- It returns only correct and the real insert index. No date, year, or precision.
 -- submit_game turns each insert_index into guessed_before / guessed_after.
 -- The score is the share of scored pairs in guess_pairs_v (ties are ignored).
 -- region_group is derived from the ISO country so the analysis views fill in.
 
-CREATE OR REPLACE FUNCTION get_game_events(p_n integer DEFAULT 10)
-RETURNS TABLE (id bigint, title text, description text, category text)
+DROP FUNCTION IF EXISTS get_game_events(integer);
+DROP FUNCTION IF EXISTS get_game_events(integer, integer);
+
+CREATE OR REPLACE FUNCTION get_game_events(p_n integer DEFAULT 10, p_level integer DEFAULT 1)
+RETURNS TABLE (
+    id bigint,
+    title text,
+    description text,
+    category text,
+    date_text text,
+    "precision" text
+)
 LANGUAGE sql
 VOLATILE
 SECURITY DEFINER
 SET search_path = public
 AS $$
-    SELECT e.id, e.title, e.description, e.category
-    FROM events e
-    WHERE e.active
-    ORDER BY random()
-    LIMIT LEAST(GREATEST(COALESCE(p_n, 10), 1), 50);
+    WITH picked AS (
+        SELECT
+            e.id,
+            e.title,
+            e.description,
+            e.category,
+            e.date_text,
+            e.precision,
+            row_number() OVER (ORDER BY random()) AS n
+        FROM events e
+        WHERE e.active
+          AND e.niche_level::text = LEAST(GREATEST(COALESCE(p_level, 1), 1), 3)::text
+    )
+    SELECT
+        picked.id,
+        picked.title,
+        picked.description,
+        picked.category,
+        CASE WHEN picked.n = 1 THEN picked.date_text END,
+        CASE WHEN picked.n = 1 THEN picked.precision END
+    FROM picked
+    WHERE picked.n <= LEAST(GREATEST(COALESCE(p_n, 10), 1), 50)
+    ORDER BY picked.n;
 $$;
 
 CREATE OR REPLACE FUNCTION submit_game(
@@ -55,6 +89,9 @@ DECLARE
     v_seq      integer := 0;
     v_score    integer;
     v_timeline jsonb;
+    v_skipped  boolean;
+    v_skipped_ids bigint[] := ARRAY[]::bigint[];
+    v_earlier  integer;
 BEGIN
     IF p_player_id IS NULL THEN
         RAISE EXCEPTION 'player id is required';
@@ -137,10 +174,9 @@ BEGIN
             v_ms := NULL;
         END IF;
 
-        IF v_event IS NULL
-           OR v_index IS NULL
-           OR v_index < 0
-           OR v_index > COALESCE(cardinality(v_tl), 0) THEN
+        v_skipped := lower(COALESCE(v_item->>'skipped', '')) = 'true';
+
+        IF v_event IS NULL THEN
             RAISE EXCEPTION 'invalid placement at step %', v_seq;
         END IF;
         IF v_event = ANY (v_tl) THEN
@@ -148,6 +184,25 @@ BEGIN
         END IF;
         IF NOT EXISTS (SELECT 1 FROM events WHERE id = v_event) THEN
             RAISE EXCEPTION 'unknown event at step %', v_seq;
+        END IF;
+
+        IF v_skipped THEN
+            SELECT count(*) FILTER (WHERE k.ko < k.ke)::integer
+            INTO v_earlier
+            FROM unnest(v_tl) AS u(id)
+            JOIN events o ON o.id = u.id
+            JOIN events e ON e.id = v_event
+            CROSS JOIN LATERAL (
+                SELECT
+                    CASE WHEN e.precision = 'month' OR o.precision = 'month' THEN left(e.date_text, 7) ELSE e.date_text END AS ke,
+                    CASE WHEN e.precision = 'month' OR o.precision = 'month' THEN left(o.date_text, 7) ELSE o.date_text END AS ko
+            ) k;
+            v_index := COALESCE(v_earlier, 0);
+            v_skipped_ids := v_skipped_ids || v_event;
+        ELSIF v_index IS NULL
+           OR v_index < 0
+           OR v_index > COALESCE(cardinality(v_tl), 0) THEN
+            RAISE EXCEPTION 'invalid placement at step %', v_seq;
         END IF;
 
         IF v_index = 0 THEN
@@ -166,13 +221,15 @@ BEGIN
         INSERT INTO session_events (session_id, event_id, seq)
         VALUES (v_session, v_event, v_seq);
 
-        INSERT INTO guesses (
-            session_id, player_id, event_id, seq,
-            guessed_before, guessed_after, response_ms
-        ) VALUES (
-            v_session, p_player_id, v_event, v_seq,
-            v_before, v_after, v_ms
-        );
+        IF NOT v_skipped THEN
+            INSERT INTO guesses (
+                session_id, player_id, event_id, seq,
+                guessed_before, guessed_after, response_ms
+            ) VALUES (
+                v_session, p_player_id, v_event, v_seq,
+                v_before, v_after, v_ms
+            );
+        END IF;
     END LOOP;
 
     IF COALESCE(cardinality(v_tl), 0) <> v_seq THEN
@@ -218,7 +275,8 @@ BEGIN
             'precision', truth.precision,
             'your_pos', ordered.your_pos,
             'true_pos', truth.true_pos,
-            'shift', ordered.your_pos - truth.true_pos
+            'shift', ordered.your_pos - truth.true_pos,
+            'skipped', truth.id = ANY (v_skipped_ids)
         )
         ORDER BY ordered.your_pos
     ), '[]'::jsonb)
@@ -234,8 +292,81 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION get_game_events(integer) FROM PUBLIC;
+CREATE OR REPLACE FUNCTION check_placement(
+    p_ordered      jsonb,
+    p_event_id     bigint,
+    p_insert_index integer
+) RETURNS jsonb
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_ids     bigint[];
+    v_n       integer;
+    v_earlier integer;
+    v_later   integer;
+    v_low     integer;
+    v_high    integer;
+    v_at      integer;
+BEGIN
+    IF p_event_id IS NULL OR p_insert_index IS NULL THEN
+        RAISE EXCEPTION 'placement is incomplete';
+    END IF;
+    IF p_ordered IS NULL OR jsonb_typeof(p_ordered) <> 'array' THEN
+        RAISE EXCEPTION 'ordered timeline must be a list';
+    END IF;
+
+    SELECT COALESCE(array_agg(item.id ORDER BY item.ord), '{}')
+    INTO v_ids
+    FROM (
+        SELECT (value)::bigint AS id, ordinality AS ord
+        FROM jsonb_array_elements_text(p_ordered) WITH ORDINALITY
+    ) item;
+
+    v_n := COALESCE(cardinality(v_ids), 0);
+    IF p_insert_index < 0 OR p_insert_index > v_n THEN
+        RAISE EXCEPTION 'invalid placement';
+    END IF;
+    IF p_event_id = ANY (v_ids) THEN
+        RAISE EXCEPTION 'event is already on the timeline';
+    END IF;
+    IF (SELECT count(DISTINCT x) FROM unnest(v_ids) AS x) <> v_n THEN
+        RAISE EXCEPTION 'duplicate event on the timeline';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM events WHERE id = p_event_id)
+       OR (SELECT count(*) FROM events WHERE id = ANY (v_ids)) <> v_n THEN
+        RAISE EXCEPTION 'unknown event';
+    END IF;
+
+    SELECT
+        count(*) FILTER (WHERE k.ko < k.ke)::integer,
+        count(*) FILTER (WHERE k.ko > k.ke)::integer
+    INTO v_earlier, v_later
+    FROM unnest(v_ids) AS u(id)
+    JOIN events o ON o.id = u.id
+    JOIN events e ON e.id = p_event_id
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE WHEN e.precision = 'month' OR o.precision = 'month' THEN left(e.date_text, 7) ELSE e.date_text END AS ke,
+            CASE WHEN e.precision = 'month' OR o.precision = 'month' THEN left(o.date_text, 7) ELSE o.date_text END AS ko
+    ) k;
+
+    v_low := COALESCE(v_earlier, 0);
+    v_high := v_n - COALESCE(v_later, 0);
+    v_at := least(greatest(p_insert_index, v_low), v_high);
+
+    RETURN jsonb_build_object(
+        'correct', p_insert_index BETWEEN v_low AND v_high,
+        'insert_index', v_at
+    );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION get_game_events(integer, integer) FROM PUBLIC;
 REVOKE ALL ON FUNCTION submit_game(uuid, jsonb, jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION check_placement(jsonb, bigint, integer) FROM PUBLIC;
 
 ALTER TABLE events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE events_review ENABLE ROW LEVEL SECURITY;
@@ -253,8 +384,9 @@ BEGIN
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
             EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA public FROM %I', r);
             EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM %I', r);
-            EXECUTE format('GRANT EXECUTE ON FUNCTION get_game_events(integer) TO %I', r);
+            EXECUTE format('GRANT EXECUTE ON FUNCTION get_game_events(integer, integer) TO %I', r);
             EXECUTE format('GRANT EXECUTE ON FUNCTION submit_game(uuid, jsonb, jsonb) TO %I', r);
+            EXECUTE format('GRANT EXECUTE ON FUNCTION check_placement(jsonb, bigint, integer) TO %I', r);
         END IF;
     END LOOP;
 END $$;
