@@ -8,6 +8,7 @@ const props = defineProps({
   newBest: { type: Boolean, default: false },
   levelName: { type: String, default: '' },
   cards: { type: Number, default: 0 },
+  misses: { type: Object, default: () => ({}) },
 })
 
 const emit = defineEmits(['again'])
@@ -98,21 +99,14 @@ const timeline = computed(() => {
 
 const score = computed(() => {
   const value = Number(props.result.score)
-  return Number.isFinite(value) ? Math.round(value) : 0
+  return Number.isFinite(value) ? value: 0
 })
 
-const scored = computed(() => timeline.value.filter((row) => row.skipped !== true))
+function missedWay(card) {
 
-const standout = computed(() => {
-  const amounts = scored.value.map((row) => Math.abs(row.shift)).filter(Boolean)
-  if (!amounts.length) return new Set()
-  const max = Math.max(...amounts)
-  const majors = new Set([max])
-  const alone = scored.value.filter((row) => Math.abs(row.shift) === max).length === 1
-  const next = Math.max(0, ...amounts.filter((amount) => amount < max))
-  if (alone && next) majors.add(next)
-  return majors
-})
+
+  return props.misses[String(card.id)] || ''
+}
 
 const shown = computed(() => {
   const rows = [...timeline.value]
@@ -126,17 +120,13 @@ watch(shown, async () => {
 })
 
 const shareText = computed(() => {
-  const rows = timeline.value.filter((row) => row.skipped !== true)
-  const right = rows.filter((row) => row.shift === 0).length
+  const rows = timeline.value
+  const missed = rows.filter((row) => missedWay(row))
   let text = props.died ? 'Out of lives. ' : ''
-  text += `I ordered ${right}/${rows.length} events right.`
-  const featured = rows.reduce((best, row) => {
-    if (row.shift === 0) return best
-    if (!best || Math.abs(row.shift) > Math.abs(best.shift)) return row
-    return best
-  }, null)
+  text += `Score ${props.cards}.`
+  const featured = missed[0]
   if (featured) {
-    const how = featured.shift > 0 ? 'way more recent' : 'way older'
+    const how = missedWay(featured) === 'recent' ? 'way more recent' : 'way older'
     text += ` "${featured.title}" felt ${how} than it was.`
   }
   text += ` ${location.origin}`
@@ -167,12 +157,8 @@ function formatWhen(dateText, precision) {
 }
 
 function cardClass(card) {
-  if (card.skipped) return {}
-  const amount = Math.abs(card.shift)
-  return {
-    'is-major': amount > 0 && standout.value.has(amount),
-    'is-off': amount > 0 && !standout.value.has(amount),
-  }
+  if (!missedWay(card)) return {}
+  return { 'is-off': true }
 }
 
 async function copy() {
@@ -209,9 +195,8 @@ async function copy() {
           <p class="tag">{{ label(card.category) }}</p>
           <h3>{{ card.title }}</h3>
           <p class="when">{{ formatWhen(card.date_text, card.precision) }}</p>
-          <p v-if="card.skipped" class="shift">Skipped</p>
-          <p v-else-if="card.shift > 0" class="shift">Felt more recent than it really was</p>
-          <p v-else-if="card.shift < 0" class="shift">Felt older than it really was</p>
+          <p v-if="missedWay(card) === 'recent'" class="shift">Felt more recent than it really was</p>
+          <p v-else-if="missedWay(card) === 'older'" class="shift">Felt older than it really was</p>
         </article>
         <p class="end">later →</p>
         <svg

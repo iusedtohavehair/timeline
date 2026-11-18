@@ -28,6 +28,7 @@ const pendingDrop = ref(null)
 const skipsLeft = ref(3)
 const lives = ref(3)
 const score = ref(0)
+const misses = ref({})
 const level = ref(1)
 const died = ref(false)
 const bestScore = ref(0)
@@ -155,6 +156,7 @@ async function startRound() {
   skipsLeft.value = 3
   lives.value = 3
   score.value = 0
+  misses.value = {}
   died.value = false
   newBest.value = false
   bestScore.value = readBest(level.value)
@@ -219,6 +221,10 @@ async function resolveDrop() {
     verdict.value = { correct: data.correct === true, id: drop.event.id }
     if (data.correct === true) score.value += 1
     else {
+      misses.value = {
+        ...misses.value,
+        [String(drop.event.id)]: drop.index > at ? 'recent' : 'older',
+      }
       lives.value -= 1
       if (lives.value <= 0) died.value = true
     }
@@ -321,6 +327,7 @@ function onPrivacyClick(event) {
         :new-best="newBest"
         :level-name="levelName"
         :cards="score"
+        :misses="misses"
         @again="playAgain"
       />
     </section>
